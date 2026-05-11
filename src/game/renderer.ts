@@ -24,15 +24,6 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState) {
 
   ctx.save();
 
-  // Screen shake
-  if (state.shakeTimer > 0) {
-    const intensity = state.shakeIntensity * (state.shakeTimer / 0.3);
-    ctx.translate(
-      (Math.random() - 0.5) * intensity,
-      (Math.random() - 0.5) * intensity
-    );
-  }
-
   // Clear
   ctx.fillStyle = '#1a1a2e';
   ctx.fillRect(-10, -10, W + 20, H + 20);
@@ -518,22 +509,210 @@ function drawHUD(ctx: CanvasRenderingContext2D, state: GameState, W: number, H: 
 }
 
 function drawGameOver(ctx: CanvasRenderingContext2D, state: GameState, W: number, H: number) {
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  const elapsed = state.gameTime - state.gameOverTime;
+  const cx = W / 2;
+  const cy = H / 2;
+  const winColor = state.winnerColor || '#ffdd44';
+
+  // ---- Phase timings ----
+  const FADE_DUR = 0.8;      // background dims
+  const SPIRAL_DUR = 2.5;    // spiraling ring effect
+  const ZOOM_DUR = 1.2;      // text zoom-in
+  const TOTAL_INTRO = FADE_DUR + ZOOM_DUR;
+
+  // ---- 1. Background dim (fades in) ----
+  const dimAlpha = Math.min(1, elapsed / FADE_DUR) * 0.8;
+  ctx.fillStyle = `rgba(0,0,0,${dimAlpha})`;
   ctx.fillRect(0, 0, W, H);
 
-  ctx.fillStyle = '#ffdd44';
-  ctx.font = 'bold 40px monospace';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+  // ---- 2. Spiraling particles / rings ----
+  if (elapsed > 0.2) {
+    const spiralT = Math.min(1, (elapsed - 0.2) / SPIRAL_DUR);
+    const ringCount = 3;
+    for (let r = 0; r < ringCount; r++) {
+      const ringPhase = r * (Math.PI * 2 / ringCount);
+      const radius = 30 + spiralT * Math.min(W, H) * 0.4 * (1 - r * 0.15);
+      const dotCount = 12 + r * 6;
+      const rotSpeed = (r % 2 === 0 ? 1 : -1) * (2 + r * 0.5);
+      
+      for (let d = 0; d < dotCount; d++) {
+        const angle = ringPhase + (d / dotCount) * Math.PI * 2 + elapsed * rotSpeed;
+        const dr = radius * (0.8 + Math.sin(elapsed * 3 + d) * 0.2);
+        const dx = cx + Math.cos(angle) * dr;
+        const dy = cy + Math.sin(angle) * dr;
+        const dotAlpha = spiralT * (0.4 + Math.sin(elapsed * 5 + d * 0.7) * 0.3);
+        const dotSize = 2 + Math.sin(elapsed * 4 + d) * 1.5;
 
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 24px monospace';
-  ctx.fillText(state.winner || 'Draw!', W / 2, H / 2 + 10);
+        ctx.globalAlpha = Math.max(0, dotAlpha);
+        ctx.fillStyle = r === 0 ? winColor : r === 1 ? '#ffffff' : '#ffaa00';
+        ctx.beginPath();
+        ctx.arc(dx, dy, dotSize, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
 
-  ctx.fillStyle = '#aaaaaa';
-  ctx.font = '16px monospace';
-  ctx.fillText('Press ENTER to return to menu', W / 2, H / 2 + 50);
+  // ---- 3. Radiating beams from center ----
+  if (elapsed > 0.5) {
+    const beamT = Math.min(1, (elapsed - 0.5) / 1.5);
+    const beamCount = 16;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(elapsed * 0.3);
+    for (let i = 0; i < beamCount; i++) {
+      const angle = (i / beamCount) * Math.PI * 2;
+      const beamLen = beamT * Math.min(W, H) * 0.7;
+      const grad = ctx.createLinearGradient(0, 0, Math.cos(angle) * beamLen, Math.sin(angle) * beamLen);
+      grad.addColorStop(0, `rgba(255,255,255,${0.15 * beamT})`);
+      grad.addColorStop(0.5, `rgba(255,200,50,${0.08 * beamT})`);
+      grad.addColorStop(1, 'rgba(255,200,50,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      const spread = 0.06;
+      ctx.lineTo(Math.cos(angle - spread) * beamLen, Math.sin(angle - spread) * beamLen);
+      ctx.lineTo(Math.cos(angle + spread) * beamLen, Math.sin(angle + spread) * beamLen);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---- 4. Central shockwave ring ----
+  if (elapsed > 0.3 && elapsed < 2.5) {
+    const shockT = (elapsed - 0.3) / 2.2;
+    const shockR = shockT * Math.min(W, H) * 0.55;
+    const shockAlpha = (1 - shockT) * 0.6;
+    ctx.strokeStyle = winColor;
+    ctx.lineWidth = 3 * (1 - shockT) + 1;
+    ctx.globalAlpha = Math.max(0, shockAlpha);
+    ctx.beginPath();
+    ctx.arc(cx, cy, shockR, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 5. "GAME OVER" text with zoom-in + rotation ----
+  if (elapsed > FADE_DUR * 0.5) {
+    const textT = Math.min(1, (elapsed - FADE_DUR * 0.5) / ZOOM_DUR);
+    // Elastic ease-out
+    const elastic = textT < 1 ? 1 - Math.pow(2, -10 * textT) * Math.cos(textT * Math.PI * 3) : 1;
+    const scale = elastic;
+    const rotation = (1 - textT) * Math.PI * 2; // full spiral in
+
+    ctx.save();
+    ctx.translate(cx, cy - 50);
+    ctx.rotate(rotation);
+    ctx.scale(scale, scale);
+
+    // Text shadow / glow
+    ctx.shadowColor = winColor;
+    ctx.shadowBlur = 20 + Math.sin(elapsed * 4) * 10;
+    ctx.fillStyle = '#ffdd44';
+    ctx.font = 'bold 56px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('GAME OVER', 0, 0);
+
+    // Outline
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#cc8800';
+    ctx.lineWidth = 2;
+    ctx.strokeText('GAME OVER', 0, 0);
+
+    ctx.restore();
+  }
+
+  // ---- 6. Winner name with delayed zoom ----
+  if (elapsed > TOTAL_INTRO * 0.7) {
+    const nameT = Math.min(1, (elapsed - TOTAL_INTRO * 0.7) / 0.8);
+    // Bounce ease
+    const bounce = nameT < 1 
+      ? 1 - Math.abs(Math.cos(nameT * Math.PI * 2)) * (1 - nameT)
+      : 1;
+    const nameScale = bounce;
+
+    ctx.save();
+    ctx.translate(cx, cy + 20);
+    ctx.scale(nameScale, nameScale);
+    ctx.globalAlpha = Math.min(1, nameT * 2);
+
+    // Winner text with colored glow
+    ctx.shadowColor = winColor;
+    ctx.shadowBlur = 15;
+    ctx.fillStyle = winColor;
+    ctx.font = 'bold 36px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(state.winner || 'Draw!', 0, 0);
+    ctx.shadowBlur = 0;
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 7. Crown / trophy emoji for winner ----
+  if (elapsed > TOTAL_INTRO) {
+    const crownT = Math.min(1, (elapsed - TOTAL_INTRO) / 0.6);
+    const crownBounce = 1 - Math.pow(1 - crownT, 3);
+    const crownY = cy - 100 + (1 - crownBounce) * -30;
+
+    ctx.save();
+    ctx.globalAlpha = crownBounce;
+    ctx.font = `${36 + Math.sin(elapsed * 3) * 4}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(state.winner === 'Draw!' ? '🤝' : '👑', cx, crownY);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 8. Floating sparkle particles ----
+  if (elapsed > 0.5) {
+    const seed = Math.floor(state.gameOverTime * 1000);
+    const sparkCount = 30;
+    for (let i = 0; i < sparkCount; i++) {
+      const rng = ((seed + i * 7919) % 10007) / 10007;
+      const rng2 = ((seed + i * 6271) % 10007) / 10007;
+      const rng3 = ((seed + i * 3571) % 10007) / 10007;
+      const sparkX = rng * W;
+      const sparkLife = (elapsed - 0.5 + rng2 * 3) % 4;
+      const sparkY = cy + 150 - sparkLife * 80 - rng3 * 100;
+      const sparkAlpha = Math.max(0, 1 - sparkLife / 4) * 0.7;
+      const sparkSize = 1.5 + rng * 2;
+      const colors = [winColor, '#ffffff', '#ffdd44', '#ffaa00', '#ff6644'];
+      
+      ctx.globalAlpha = sparkAlpha;
+      ctx.fillStyle = colors[i % colors.length];
+      ctx.beginPath();
+      // Star shape
+      const sr = sparkSize;
+      for (let p = 0; p < 5; p++) {
+        const a = (p / 5) * Math.PI * 2 - Math.PI / 2 + elapsed * 2;
+        const ox = p === 0 ? 0 : 0;
+        ctx.lineTo(sparkX + Math.cos(a) * sr * 2 + ox, sparkY + Math.sin(a) * sr * 2);
+        const a2 = a + Math.PI / 5;
+        ctx.lineTo(sparkX + Math.cos(a2) * sr, sparkY + Math.sin(a2) * sr);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 9. "Press ENTER" prompt (fades in last) ----
+  if (elapsed > TOTAL_INTRO + 0.5) {
+    const promptAlpha = Math.min(1, elapsed - TOTAL_INTRO - 0.5);
+    const blink = Math.sin(elapsed * 3) > 0 ? 1 : 0.4;
+    ctx.globalAlpha = promptAlpha * blink;
+    ctx.fillStyle = '#aaaaaa';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Press ENTER to return to menu', cx, cy + 80);
+    ctx.globalAlpha = 1;
+  }
 }
 
 /** Lighten a hex color */

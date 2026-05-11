@@ -143,10 +143,27 @@ export interface GameState {
   particles: Particle[];
   gameOver: boolean;
   winner: string | null;
+  winnerColor: string | null;
+  gameOverTime: number;    // timestamp when game ended (for animation)
   paused: boolean;
   gameTime: number;
   shakeTimer: number;
   shakeIntensity: number;
+  params: GameParams;      // runtime-tweakable parameters
+}
+
+/** Tweakable game parameters */
+export interface GameParams {
+  startBombs: number;       // no gameplay cap
+  startFlame: number;       // no gameplay cap
+  startSpeed: number;       // no gameplay cap (boost levels above base)
+  bombTimer: number;        // 1.0–5.0 seconds
+  explosionDuration: number;// 0.2–2.0 seconds
+  brickDensity: number;     // 0.1–0.9
+  powerUpChance: number;    // 0.0–1.0
+  suddenDeath: boolean;     // closing walls
+  startPierce: boolean;
+  startShield: boolean;
 }
 
 /** Menu configuration */
@@ -154,6 +171,7 @@ export interface GameConfig {
   mapSize: MapSize;
   mode: GameMode;
   playerKeys: KeyBindings[];
+  params: GameParams;
 }
 
 /** Map size dimensions */

@@ -6,7 +6,12 @@ import { Tile, PowerUpType, MapSize } from './types';
 import { MAP_SIZES, POWERUP_CHANCE, getSpawnPositions } from './constants';
 
 /** Generate the game map grid */
-export function generateMap(mapSize: MapSize, numPlayers: number): { tiles: Tile[][]; cols: number; rows: number } {
+export function generateMap(
+  mapSize: MapSize,
+  numPlayers: number,
+  brickDensity: number = 0.7,
+  powerUpChance: number = POWERUP_CHANCE,
+): { tiles: Tile[][]; cols: number; rows: number } {
   const { cols, rows } = MAP_SIZES[mapSize];
   const tiles: Tile[][] = [];
   const spawns = getSpawnPositions(cols, rows).slice(0, numPlayers);
@@ -43,9 +48,9 @@ export function generateMap(mapSize: MapSize, numPlayers: number): { tiles: Tile
         tiles[gy][gx] = { type: 'empty' };
       }
       // Random bricks with power-ups hidden
-      else if (Math.random() < 0.7) {
+      else if (Math.random() < brickDensity) {
         const tile: Tile = { type: 'brick' };
-        if (Math.random() < POWERUP_CHANCE) {
+        if (Math.random() < powerUpChance) {
           // Weighted power-up selection
           const roll = Math.random();
           let powerUp: PowerUpType;

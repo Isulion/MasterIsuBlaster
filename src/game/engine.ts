@@ -5,16 +5,16 @@
 
 import {
   GameState, Player, Bomb,
-  Direction, GameConfig, Tile, KeyBindings, SkullEffect,
+  Direction, GameConfig, Tile, KeyBindings, SkullEffect, GameParams,
 } from './types';
 import {
-  TILE_SIZE, BOMB_TIMER, EXPLOSION_DURATION, BASE_SPEED,
-  SPEED_BOOST, START_BOMBS, START_FLAME, SPAWN_INVINCIBILITY,
+  TILE_SIZE, BASE_SPEED,
+  SPEED_BOOST, SPAWN_INVINCIBILITY,
   PLAYER_COLORS, PLAYER_NAMES, getSpawnPositions, MAP_SIZES,
-  MAX_FLAME, MAX_BOMBS, MAX_SPEED_BOOSTS, SKULL_DURATION,
+  SKULL_DURATION,
 } from './constants';
 import { generateMap } from './map';
-import { decideAI, resetAI } from './ai';
+import { decideAI, resetAI, shouldAIDropBombNow } from './ai';
 import { playPlaceBomb, playExplosion, playPowerUp, playDeath, playWin, playShieldBreak, playSkull } from './audio';
 
 const T = TILE_SIZE;
@@ -34,33 +34,25 @@ export function handleKeyUp(e: KeyboardEvent) {
 
 export function createGameState(config: GameConfig): GameState {
   resetAI();
+  const p = config.params;
   const { cols, rows } = MAP_SIZES[config.mapSize];
-  const mapData = generateMap(config.mapSize, getPlayerCount(config));
+  const mapData = generateMap(config.mapSize, getPlayerCount(config), p.brickDensity, p.powerUpChance);
   const spawns = getSpawnPositions(cols, rows);
+  const numPlayers = getPlayerCount(config);
 
   const players: Player[] = [];
+  const mkP = (id: number, ai: boolean, keys: KeyBindings) =>
+    createPlayer(id, spawns[id], ai, keys, p);
 
   if (config.mode === 'solo') {
-    players.push(createPlayer(0, spawns[0], false, config.playerKeys[0]));
-    players.push(createPlayer(1, spawns[1], true, config.playerKeys[0]));
-    players.push(createPlayer(2, spawns[2], true, config.playerKeys[0]));
-    players.push(createPlayer(3, spawns[3], true, config.playerKeys[0]));
+    players.push(mkP(0, false, config.playerKeys[0]));
+    for (let i = 1; i < 4; i++) players.push(mkP(i, true, config.playerKeys[0]));
   } else if (config.mode === 'pvp') {
-    players.push(createPlayer(0, spawns[0], false, config.playerKeys[0]));
-    players.push(createPlayer(1, spawns[1], false, config.playerKeys[1]));
-    players.push(createPlayer(2, spawns[2], true, config.playerKeys[0]));
-    players.push(createPlayer(3, spawns[3], true, config.playerKeys[0]));
-  } else if (config.mode === 'ai10') {
-    for (let i = 0; i < 10; i++) players.push(createPlayer(i, spawns[i], true, config.playerKeys[0]));
-  } else if (config.mode === 'ai20') {
-    for (let i = 0; i < 20; i++) players.push(createPlayer(i, spawns[i], true, config.playerKeys[0]));
-  } else if (config.mode === 'ai40') {
-    for (let i = 0; i < 40; i++) players.push(createPlayer(i, spawns[i], true, config.playerKeys[0]));
+    players.push(mkP(0, false, config.playerKeys[0]));
+    players.push(mkP(1, false, config.playerKeys[1]));
+    for (let i = 2; i < 4; i++) players.push(mkP(i, true, config.playerKeys[0]));
   } else {
-    players.push(createPlayer(0, spawns[0], true, config.playerKeys[0]));
-    players.push(createPlayer(1, spawns[1], true, config.playerKeys[0]));
-    players.push(createPlayer(2, spawns[2], true, config.playerKeys[0]));
-    players.push(createPlayer(3, spawns[3], true, config.playerKeys[0]));
+    for (let i = 0; i < numPlayers; i++) players.push(mkP(i, true, config.playerKeys[0]));
   }
 
   return {
@@ -75,10 +67,13 @@ export function createGameState(config: GameConfig): GameState {
     particles: [],
     gameOver: false,
     winner: null,
+    winnerColor: null,
+    gameOverTime: 0,
     paused: false,
     gameTime: 0,
     shakeTimer: 0,
     shakeIntensity: 0,
+    params: p,
   };
 }
 
@@ -93,16 +88,17 @@ function createPlayer(
   id: number,
   spawn: { gx: number; gy: number },
   isAI: boolean,
-  keys: KeyBindings
+  keys: KeyBindings,
+  p: GameParams,
 ): Player {
   return {
     id,
     x: spawn.gx * T + T / 2,
     y: spawn.gy * T + T / 2,
-    speed: BASE_SPEED,
+    speed: BASE_SPEED + SPEED_BOOST * p.startSpeed,
     bombCount: 0,
-    maxBombs: START_BOMBS,
-    flameRange: START_FLAME,
+    maxBombs: p.startBombs,
+    flameRange: p.startFlame,
     alive: true,
     isAI,
     direction: 'none',
@@ -113,8 +109,8 @@ function createPlayer(
     keys,
     placedBombTiles: new Set<string>(),
     invincibleTimer: SPAWN_INVINCIBILITY,
-    hasPierce: false,
-    hasShield: false,
+    hasPierce: p.startPierce,
+    hasShield: p.startShield,
     skullEffect: null,
     skullTimer: 0,
     inventory: [],
@@ -127,10 +123,12 @@ const aiTimers = new Map<number, number>();
 // ---- Main Update Loop ----
 
 export function updateGame(state: GameState, dt: number): void {
-  if (state.paused || state.gameOver) return;
+  if (state.paused) return;
 
   state.gameTime += dt;
-  if (state.shakeTimer > 0) state.shakeTimer -= dt;
+
+  // After game over, keep advancing time for the animation but skip gameplay
+  if (state.gameOver) return;
 
   // Update players
   for (const player of state.players) {
@@ -218,21 +216,22 @@ function updateAIPlayer(state: GameState, player: Player, dt: number) {
   let timer = aiTimers.get(player.id) || 0;
   timer -= dt;
 
-  const pgx = Math.floor(player.x / T);
-  const pgy = Math.floor(player.y / T);
+  const beforeGx = Math.floor(player.x / T);
+  const beforeGy = Math.floor(player.y / T);
 
   if (timer <= 0) {
-    // Throttle AI decision rate on ultra-large battles to keep runtime smooth.
-    const decisionBase = state.players.length >= 40 ? 0.14 : state.players.length >= 20 ? 0.11 : 0.08;
-    const decisionVar = state.players.length >= 40 ? 0.08 : 0.06;
+    // Faster reaction for high-speed AI so they can change direction in time.
+    const crowdBase = state.players.length >= 40 ? 0.11 : state.players.length >= 20 ? 0.09 : 0.07;
+    const speedFactor = Math.max(0.45, BASE_SPEED / Math.max(BASE_SPEED, player.speed));
+    const decisionBase = crowdBase * speedFactor;
+    const decisionVar = (state.players.length >= 40 ? 0.05 : 0.04) * speedFactor;
     timer = decisionBase + Math.random() * decisionVar;
+
     let action = decideAI(state, player);
 
     if (action.placeBomb) {
       tryPlaceBomb(state, player);
-      // CRITICAL: After placing a bomb the AI is now standing on
-      // a live bomb. Re-query immediately so it starts escaping
-      // on this very frame instead of waiting for the next tick.
+      // After placing a bomb, re-query so the AI starts escaping immediately.
       action = decideAI(state, player);
     }
 
@@ -242,31 +241,74 @@ function updateAIPlayer(state: GameState, player: Player, dt: number) {
   // Move AI smoothly toward target
   const dir = aiDirs.get(player.id) || 'none';
   if (dir !== 'none') {
+    // Strong pre-turn alignment for AI: before moving, pull the bot toward
+    // the lane center on the perpendicular axis. This is the key fix for
+    // high-speed turning at intersections.
+    alignAIToLane(state, player, dir, dt);
     movePlayer(state, player, dir, dt);
-
-    // Snap to grid center on the axis perpendicular to movement.
-    // This prevents AI from getting misaligned and stuck on corners.
-    const centerX = pgx * T + T / 2;
-    const centerY = pgy * T + T / 2;
-    const snapStrength = Math.min(1, 6 * dt);
-    if (dir === 'up' || dir === 'down') {
-      if (Math.abs(player.x - centerX) > 1) {
-        player.x += (centerX - player.x) * snapStrength;
-      }
-    } else {
-      if (Math.abs(player.y - centerY) > 1) {
-        player.y += (centerY - player.y) * snapStrength;
-      }
-    }
+    // And re-align after motion to absorb any residual drift.
+    alignAIToLane(state, player, dir, dt);
   } else {
     player.direction = 'none';
   }
 
   aiTimers.set(player.id, timer);
+
+  // Collect any bonus on the tile first, then aggressively spend any spare
+  // bomb slots as soon as the AI reaches a new valid tile.
   checkPowerUpPickup(state, player);
+  const afterGx = Math.floor(player.x / T);
+  const afterGy = Math.floor(player.y / T);
+  if ((afterGx !== beforeGx || afterGy !== beforeGy || dir === 'none') && shouldAIDropBombNow(state, player)) {
+    tryPlaceBomb(state, player);
+  }
 }
 
 // ---- Movement with Pixel-Perfect Collision ----
+
+/** Nearest tile-center helper */
+function nearestTileCenter(coord: number): number {
+  return Math.round((coord - T / 2) / T) * T + T / 2;
+}
+
+/** Strong lane alignment for AI before/after turns.
+ *  This is much stronger than the old soft snap and scales with speed. */
+function alignAIToLane(state: GameState, player: Player, dir: Direction, dt: number) {
+  if (!player.isAI || dir === 'none') return;
+
+  const halfW = T * 0.38;
+  const halfH = T * 0.38;
+  const laneX = nearestTileCenter(player.x);
+  const laneY = nearestTileCenter(player.y);
+  const turnAssist = Math.max(8, player.speed * 1.6) * dt;
+
+  if (dir === 'up' || dir === 'down') {
+    const dx = laneX - player.x;
+    if (Math.abs(dx) <= turnAssist * 1.2) {
+      // Hard snap when close enough so intersections are not missed.
+      if (checkCollision(state, player, laneX, player.y, halfW, halfH)) {
+        player.x = laneX;
+      }
+    } else {
+      const nx = player.x + Math.sign(dx) * turnAssist;
+      if (checkCollision(state, player, nx, player.y, halfW, halfH)) {
+        player.x = nx;
+      }
+    }
+  } else {
+    const dy = laneY - player.y;
+    if (Math.abs(dy) <= turnAssist * 1.2) {
+      if (checkCollision(state, player, player.x, laneY, halfW, halfH)) {
+        player.y = laneY;
+      }
+    } else {
+      const ny = player.y + Math.sign(dy) * turnAssist;
+      if (checkCollision(state, player, player.x, ny, halfW, halfH)) {
+        player.y = ny;
+      }
+    }
+  }
+}
 
 function movePlayer(state: GameState, player: Player, dir: Direction, dt: number) {
   player.direction = dir;
@@ -275,38 +317,43 @@ function movePlayer(state: GameState, player: Player, dir: Direction, dt: number
 
   // Apply slow skull effect (half speed)
   const effectiveSpeed = player.skullEffect === 'slow' ? player.speed * 0.5 : player.speed;
-  const speed = effectiveSpeed * dt;
-  let newX = player.x;
-  let newY = player.y;
-
-  // Calculate intended movement
-  switch (dir) {
-    case 'up': newY -= speed; break;
-    case 'down': newY += speed; break;
-    case 'left': newX -= speed; break;
-    case 'right': newX += speed; break;
-  }
+  const totalMove = effectiveSpeed * dt;
 
   // Player collision box (slightly smaller than tile for fluid movement)
-  const halfW = T * 0.38; // collision half-width
+  const halfW = T * 0.38;
   const halfH = T * 0.38;
 
-  // Check collision with new position
-  const canMove = checkCollision(state, player, newX, newY, halfW, halfH);
+  // Sub-step movement so very fast entities don't skip intersections.
+  const maxStep = 6;
+  const steps = Math.max(1, Math.ceil(totalMove / maxStep));
+  const stepMove = totalMove / steps;
 
-  if (canMove) {
-    player.x = newX;
-    player.y = newY;
-  } else {
+  for (let s = 0; s < steps; s++) {
+    let newX = player.x;
+    let newY = player.y;
+
+    switch (dir) {
+      case 'up': newY -= stepMove; break;
+      case 'down': newY += stepMove; break;
+      case 'left': newX -= stepMove; break;
+      case 'right': newX += stepMove; break;
+    }
+
+    const canMove = checkCollision(state, player, newX, newY, halfW, halfH);
+
+    if (canMove) {
+      player.x = newX;
+      player.y = newY;
+      continue;
+    }
+
     // Try sliding along walls (corner rounding)
     if (dir === 'up' || dir === 'down') {
-      // Try sliding left or right
-      const slideAmount = speed * 0.8;
-      const gx = Math.floor(player.x / T);
-      const centerX = gx * T + T / 2;
+      const slideAmount = stepMove * 0.9;
+      const centerX = nearestTileCenter(player.x);
       const diff = player.x - centerX;
 
-      if (Math.abs(diff) > 2) {
+      if (Math.abs(diff) > 1) {
         const slideX = diff > 0 ? player.x - slideAmount : player.x + slideAmount;
         if (checkCollision(state, player, slideX, newY, halfW, halfH)) {
           player.x = slideX;
@@ -316,13 +363,11 @@ function movePlayer(state: GameState, player: Player, dir: Direction, dt: number
         }
       }
     } else {
-      // Try sliding up or down
-      const slideAmount = speed * 0.8;
-      const gy = Math.floor(player.y / T);
-      const centerY = gy * T + T / 2;
+      const slideAmount = stepMove * 0.9;
+      const centerY = nearestTileCenter(player.y);
       const diff = player.y - centerY;
 
-      if (Math.abs(diff) > 2) {
+      if (Math.abs(diff) > 1) {
         const slideY = diff > 0 ? player.y - slideAmount : player.y + slideAmount;
         if (checkCollision(state, player, newX, slideY, halfW, halfH)) {
           player.x = newX;
@@ -335,10 +380,6 @@ function movePlayer(state: GameState, player: Player, dir: Direction, dt: number
   }
 
   // Update placed bomb tiles tracking.
-  // Only remove a bomb-tile pass-through when the player's ENTIRE
-  // collision box no longer overlaps that tile. This prevents the
-  // player from getting stuck when their center has moved off but
-  // a corner still overlaps.
   for (const key of player.placedBombTiles) {
     const [bx, by] = key.split(',').map(Number);
     const tileLeft = bx * T;
@@ -349,7 +390,6 @@ function movePlayer(state: GameState, player: Player, dir: Direction, dt: number
     const pRight = player.x + halfW;
     const pTop = player.y - halfH;
     const pBottom = player.y + halfH;
-    // AABB overlap test
     const overlaps =
       pRight > tileLeft && pLeft < tileRight &&
       pBottom > tileTop && pTop < tileBottom;
@@ -382,12 +422,12 @@ function checkCollision(
     const tile = state.tiles[gy][gx];
     if (tile.type === 'wall' || tile.type === 'brick') return false;
 
-    // Check bomb collision (owner can walk through if still on bomb tile)
+    // Check bomb collision — any player who was standing on the
+    // tile when the bomb was placed can walk through until they leave.
     for (const bomb of state.bombs) {
       if (bomb.gx === gx && bomb.gy === gy) {
-        // Owner can walk through only if they haven't left yet
-        if (bomb.ownerId === player.id && player.placedBombTiles.has(`${gx},${gy}`)) {
-          continue; // allow walk-through
+        if (player.placedBombTiles.has(`${gx},${gy}`)) {
+          continue; // still overlapping — allow walk-through
         }
         return false;
       }
@@ -420,15 +460,33 @@ function tryPlaceBomb(state: GameState, player: Player) {
   const bomb: Bomb = {
     gx, gy,
     ownerId: player.id,
-    timer: BOMB_TIMER,
+    timer: state.params.bombTimer,
     range: effectiveRange,
     animTimer: 0,
     pierce: player.hasPierce,
   };
 
   state.bombs.push(bomb);
-  // Mark that player is standing on this bomb (can walk through until they leave)
-  player.placedBombTiles.add(`${gx},${gy}`);
+
+  // Mark EVERY player whose collision box overlaps this bomb tile
+  // so none of them get instantly trapped.  Each player's set entry
+  // is removed individually once that player's box fully leaves.
+  const tileKey = `${gx},${gy}`;
+  const tileLeft = gx * T;
+  const tileRight = (gx + 1) * T;
+  const tileTop = gy * T;
+  const tileBottom = (gy + 1) * T;
+  const cHalf = T * 0.38; // same collision half-size used in movement
+
+  for (const p of state.players) {
+    if (!p.alive) continue;
+    // AABB overlap test between player box and bomb tile
+    if (p.x + cHalf > tileLeft && p.x - cHalf < tileRight &&
+        p.y + cHalf > tileTop  && p.y - cHalf < tileBottom) {
+      p.placedBombTiles.add(tileKey);
+    }
+  }
+
   playPlaceBomb();
 }
 
@@ -457,18 +515,18 @@ function updateBombs(state: GameState, dt: number) {
 
 function explodeBomb(state: GameState, bomb: Bomb) {
   playExplosion();
-  state.shakeTimer = 0.2;
-  state.shakeIntensity = 4;
 
   // Remove from all players' placedBombTiles
   for (const p of state.players) {
     p.placedBombTiles.delete(`${bomb.gx},${bomb.gy}`);
   }
 
+  const expDur = state.params.explosionDuration;
+
   // Center explosion
   state.explosions.push({
     gx: bomb.gx, gy: bomb.gy,
-    timer: EXPLOSION_DURATION,
+    timer: expDur,
     direction: 'center',
     isEnd: false,
   });
@@ -502,9 +560,9 @@ function explodeBomb(state: GameState, bomb: Bomb) {
         destroyBrick(state, nx, ny, tile);
         state.explosions.push({
           gx: nx, gy: ny,
-          timer: EXPLOSION_DURATION,
+          timer: expDur,
           direction: dir,
-          isEnd: !bomb.pierce, // only end if not pierce
+          isEnd: !bomb.pierce,
         });
         if (!bomb.pierce) break; // stop unless pierce
         continue; // pierce: continue to next tile
@@ -513,7 +571,7 @@ function explodeBomb(state: GameState, bomb: Bomb) {
       // Empty: add explosion
       state.explosions.push({
         gx: nx, gy: ny,
-        timer: EXPLOSION_DURATION,
+        timer: expDur,
         direction: dir,
         isEnd: i === bomb.range,
       });
@@ -539,7 +597,7 @@ function destroyBrick(state: GameState, gx: number, gy: number, tile: Tile) {
       gx, gy,
       type: tile.powerUp,
       animTimer: 0,
-      immuneTimer: EXPLOSION_DURATION + 0.1,
+      immuneTimer: state.params.explosionDuration + 0.1,
     });
   }
 
@@ -642,7 +700,7 @@ function scatterInventory(state: GameState, player: Player) {
       gy: slot.gy,
       type: player.inventory[i],
       animTimer: 0,
-      immuneTimer: EXPLOSION_DURATION + 0.2, // survive nearby blasts
+      immuneTimer: state.params.explosionDuration + 0.2, // survive nearby blasts
     });
     // Small sparkle at drop site
     spawnDropParticle(state, slot.gx * T + T / 2, slot.gy * T + T / 2, player.color);
@@ -683,27 +741,25 @@ function checkPowerUpPickup(state: GameState, player: Player) {
 
     switch (pu.type) {
       case 'bomb':
-        player.maxBombs = Math.min(player.maxBombs + 1, MAX_BOMBS);
+        player.maxBombs += 1;
         break;
       case 'flame':
-        player.flameRange = Math.min(player.flameRange + 1, MAX_FLAME);
+        player.flameRange += 1;
         break;
       case 'speed':
-        if (player.speed < BASE_SPEED + SPEED_BOOST * MAX_SPEED_BOOSTS) {
-          player.speed += SPEED_BOOST;
-        }
+        player.speed += SPEED_BOOST;
         break;
       case 'bomb2':
-        player.maxBombs = Math.min(player.maxBombs + 2, MAX_BOMBS);
+        player.maxBombs += 2;
         break;
       case 'flame2':
-        player.flameRange = Math.min(player.flameRange + 2, MAX_FLAME);
+        player.flameRange += 2;
         break;
       case 'speed2':
-        player.speed = Math.min(player.speed + SPEED_BOOST * 2, BASE_SPEED + SPEED_BOOST * MAX_SPEED_BOOSTS);
+        player.speed += SPEED_BOOST * 2;
         break;
       case 'fullfire':
-        player.flameRange = MAX_FLAME;
+        player.flameRange += 8;
         break;
       case 'pierce':
         player.hasPierce = true;
@@ -740,10 +796,13 @@ function checkWinCondition(state: GameState) {
   const alive = state.players.filter(p => p.alive);
   if (alive.length <= 1) {
     state.gameOver = true;
+    state.gameOverTime = state.gameTime;
     if (alive.length === 1) {
       state.winner = `${alive[0].name} Wins!`;
+      state.winnerColor = alive[0].color;
     } else {
       state.winner = 'Draw!';
+      state.winnerColor = '#ffdd44';
     }
     playWin();
   }

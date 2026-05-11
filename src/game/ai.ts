@@ -375,24 +375,17 @@ function countBrickHits(state: GameState, gx: number, gy: number, range: number,
       if (nx < 0 || ny < 0 || nx >= state.cols || ny >= state.rows) break;
       const tile = state.tiles[ny][nx];
       if (tile.type === 'wall') break;
-      if (tile.type === 'brick') {
-        hits++;
-        if (!pierce) break;
-      }
+      if (tile.type === 'brick') { hits++; if (!pierce) break; }
     }
   }
   return hits;
 }
 
 /** Count how many collectible (non-skull) power-ups a bomb blast
- *  at (gx,gy) would destroy.  These are items sitting on empty
- *  tiles in the blast path — the AI must avoid wasting them. */
+ *  at (gx,gy) would destroy. */
 function countPowerUpsInBlast(state: GameState, gx: number, gy: number, range: number, pierce: boolean): number {
   let destroyed = 0;
-  // Check the bomb tile itself
-  if (state.powerUps.some(p => p.gx === gx && p.gy === gy && p.type !== 'skull')) {
-    destroyed++;
-  }
+  if (state.powerUps.some(p => p.gx === gx && p.gy === gy && p.type !== 'skull')) destroyed++;
   for (const { dx, dy } of DIRS) {
     for (let i = 1; i <= range; i++) {
       const nx = gx + dx * i;
@@ -400,10 +393,7 @@ function countPowerUpsInBlast(state: GameState, gx: number, gy: number, range: n
       if (nx < 0 || ny < 0 || nx >= state.cols || ny >= state.rows) break;
       const tile = state.tiles[ny][nx];
       if (tile.type === 'wall') break;
-      // A power-up sitting here would be destroyed
-      if (state.powerUps.some(p => p.gx === nx && p.gy === ny && p.type !== 'skull')) {
-        destroyed++;
-      }
+      if (state.powerUps.some(p => p.gx === nx && p.gy === ny && p.type !== 'skull')) destroyed++;
       if (tile.type === 'brick' && !pierce) break;
     }
   }
@@ -417,32 +407,141 @@ function countEnemyThreats(state: GameState, player: Player, gx: number, gy: num
     if (other.id === player.id || !other.alive) continue;
     const ogx = Math.floor(other.x / T);
     const ogy = Math.floor(other.y / T);
-    if (ogx === gx && ogy !== gy) {
-      if (Math.abs(ogy - gy) <= player.flameRange && !lineBlocked(state, gx, gy, gx, ogy)) threats++;
-    }
-    if (ogy === gy && ogx !== gx) {
-      if (Math.abs(ogx - gx) <= player.flameRange && !lineBlocked(state, gx, gy, ogx, gy)) threats++;
-    }
+    if (ogx === gx && ogy !== gy && Math.abs(ogy - gy) <= player.flameRange && !lineBlocked(state, gx, gy, gx, ogy)) threats++;
+    if (ogy === gy && ogx !== gx && Math.abs(ogx - gx) <= player.flameRange && !lineBlocked(state, gx, gy, ogx, gy)) threats++;
   }
   return threats;
 }
 
-/** Is it worth placing a bomb here? Returns a score.
- *  Negative = DON'T bomb (would destroy power-ups).
- *  0 = not useful.  Higher = more valuable. */
-function bombScore(state: GameState, player: Player, gx: number, gy: number): number {
-  const bricks  = countBrickHits(state, gx, gy, player.flameRange, player.hasPierce);
-  const enemies = countEnemyThreats(state, player, gx, gy);
-  const puLoss  = countPowerUpsInBlast(state, gx, gy, player.flameRange, player.hasPierce);
-  // Heavy penalty for destroying power-ups: each lost item = –20
-  // Enemies are worth a lot (+10), bricks a little (+2)
-  return enemies * 10 + bricks * 2 - puLoss * 20;
+/** How many walkable open directions does this tile have? */
+function openDirs(state: GameState, gx: number, gy: number): number {
+  let n = 0;
+  for (const { dx, dy } of DIRS) {
+    const nx = gx + dx, ny = gy + dy;
+    if (nx >= 0 && ny >= 0 && nx < state.cols && ny < state.rows) {
+      const t = state.tiles[ny][nx].type;
+      if (t !== 'wall' && t !== 'brick' && !state.bombs.some(b => b.gx === nx && b.gy === ny)) n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * True strategic intersection definition:
+ * the bomb tile must NOT be near a full square in the 4 cardinal directions.
+ * In practice that means all 4 immediate neighbours are open/walkable.
+ */
+function isIntersectionTile(state: GameState, gx: number, gy: number): boolean {
+  return openDirs(state, gx, gy) === 4;
+}
+
+/** How many open tiles does a bomb's blast cover?
+ *  Longer reach through open corridors = better coverage. */
+function blastCoverage(state: GameState, gx: number, gy: number, range: number, pierce: boolean): number {
+  let tiles = 1; // bomb tile itself
+  for (const { dx, dy } of DIRS) {
+    for (let i = 1; i <= range; i++) {
+      const nx = gx + dx * i, ny = gy + dy * i;
+      if (nx < 0 || ny < 0 || nx >= state.cols || ny >= state.rows) break;
+      const t = state.tiles[ny][nx].type;
+      if (t === 'wall') break;
+      tiles++;
+      if (t === 'brick' && !pierce) break;
+    }
+  }
+  return tiles;
+}
+
+/** Would a bomb here cut off an enemy's escape routes?
+ *  Returns bonus score for trapping potential. */
+function trapBonus(state: GameState, player: Player, gx: number, gy: number, _danger: number[][]): number {
+  let bonus = 0;
+  for (const other of state.players) {
+    if (other.id === player.id || !other.alive) continue;
+    const ogx = Math.floor(other.x / T);
+    const ogy = Math.floor(other.y / T);
+    const dist = Math.abs(ogx - gx) + Math.abs(ogy - gy);
+    if (dist > player.flameRange + 3) continue;
+    // Count enemy's safe escape routes
+    let enemyExits = 0;
+    for (const { dx, dy } of DIRS) {
+      const ex = ogx + dx, ey = ogy + dy;
+      if (ex < 0 || ey < 0 || ex >= state.cols || ey >= state.rows) continue;
+      const t = state.tiles[ey][ex].type;
+      if (t === 'wall' || t === 'brick') continue;
+      if (state.bombs.some(b => b.gx === ex && b.gy === ey)) continue;
+      // Would our new bomb's blast cover this exit?
+      if (ex === gx && Math.abs(ey - gy) <= player.flameRange && !lineBlocked(state, gx, gy, gx, ey)) continue;
+      if (ey === gy && Math.abs(ex - gx) <= player.flameRange && !lineBlocked(state, gx, gy, ex, gy)) continue;
+      enemyExits++;
+    }
+    // Fewer exits = better trap
+    if (enemyExits <= 1) bonus += 15; // nearly trapped
+    else if (enemyExits <= 2) bonus += 6;
+  }
+  return bonus;
+}
+
+/** Full strategic bomb score.
+ *  Negative = DON'T bomb (would destroy power-ups). */
+function bombScore(state: GameState, player: Player, gx: number, gy: number, danger?: number[][]): number {
+  const bricks   = countBrickHits(state, gx, gy, player.flameRange, player.hasPierce);
+  const enemies  = countEnemyThreats(state, player, gx, gy);
+  const puLoss   = countPowerUpsInBlast(state, gx, gy, player.flameRange, player.hasPierce);
+  const coverage = blastCoverage(state, gx, gy, player.flameRange, player.hasPierce);
+  const trap     = danger ? trapBonus(state, player, gx, gy, danger) : 0;
+
+  // True intersection bonus: only fully open crossroads qualify
+  const intersectionBonus = isIntersectionTile(state, gx, gy) ? 8 : 0;
+
+  // Coverage bonus: reward bombs that reach further
+  const coverageBonus = Math.max(0, coverage - 4);
+
+  return enemies * 12
+    + trap
+    + bricks * 2
+    + intersectionBonus
+    + coverageBonus
+    - puLoss * 25;
 }
 
 /** Does the AI have spare bombs it isn't using? */
 function hasSpareBombs(state: GameState, player: Player): boolean {
-  const active = countMyBombs(state, player.id);
-  return active < player.maxBombs;
+  return countMyBombs(state, player.id) < player.maxBombs;
+}
+
+/** How many spare bomb slots does the AI have? */
+function spareBombCount(state: GameState, player: Player): number {
+  return player.maxBombs - countMyBombs(state, player.id);
+}
+
+/**
+ * Strategic bombing helper used by the engine after movement.
+ * Prefers intersections and tiles with good coverage.
+ */
+export function shouldAIDropBombNow(state: GameState, player: Player): boolean {
+  const gx = Math.floor(player.x / T);
+  const gy = Math.floor(player.y / T);
+  const danger = buildDangerMap(state);
+
+  if (isDangerous(danger, gx, gy)) return false;
+  if (!hasSpareBombs(state, player)) return false;
+  if (state.bombs.some(b => b.gx === gx && b.gy === gy)) return false;
+  if (countPowerUpsInBlast(state, gx, gy, player.flameRange, player.hasPierce) > 0) return false;
+  if (!canEscapeBomb(state, player, gx, gy)) return false;
+
+  const score = bombScore(state, player, gx, gy, danger);
+  const spare = spareBombCount(state, player);
+  const intersection = isIntersectionTile(state, gx, gy);
+
+  // With plenty of spare bombs, drop anywhere useful
+  if (spare >= 3 && score >= 0) return true;
+  // With 2 spares, prefer true intersections or useful tiles
+  if (spare >= 2 && (intersection || score >= 3)) return true;
+  // With only 1 spare, only bomb at strong spots
+  if (spare >= 1 && (score >= 6 || (intersection && score >= 2))) return true;
+
+  return false;
 }
 
 /** Find the nearest enemy distance (Manhattan) */
@@ -461,9 +560,12 @@ function nearestEnemyDist(state: GameState, player: Player, gx: number, gy: numb
 // ============================================================
 // Main AI Decision Function
 //
-// PHILOSOPHY: Drop a bomb on EVERY tile we pass through as long
-// as we can escape and it won't destroy a power-up.  The AI
-// should always be bombing — idle bombs = wasted bombs.
+// STRATEGY: Use multi-bomb placement to create overlapping
+// blast zones, prefer intersections to maximise area denial,
+// and actively trap enemies by cutting off their escape routes.
+//
+// Strict priorities:
+//   1) Survival  2) Power-ups  3) Offense/Trapping  4) Clearing
 // ============================================================
 
 export function decideAI(state: GameState, player: Player): AIAction {
@@ -472,29 +574,28 @@ export function decideAI(state: GameState, player: Player): AIAction {
   const gy = Math.floor(player.y / T);
   const posKey = `${gx},${gy}`;
 
-  // Track positions for loop detection
   mem.lastPositions.push(posKey);
   if (mem.lastPositions.length > 20) mem.lastPositions.shift();
 
   const danger = buildDangerMap(state);
   const inDanger = isDangerous(danger, gx, gy);
   const canPlace = hasSpareBombs(state, player);
-  const scoreHere = bombScore(state, player, gx, gy);
-  // Is there already one of our bombs on this tile?
+  const spare = spareBombCount(state, player);
+  const scoreHere = bombScore(state, player, gx, gy, danger);
   const bombAlreadyHere = state.bombs.some(b => b.gx === gx && b.gy === gy);
+  const intersectionHere = isIntersectionTile(state, gx, gy);
 
-  // Pre-compute: should we drop a bomb RIGHT HERE while doing
-  // something else?  Yes if we have a spare, the score is
-  // non-negative (won't destroy power-ups), and we can escape.
-  // This lets us bomb on almost every tile we walk through.
+  // Should we drop a bomb on this tile while doing something else?
+  // Strategic version: prefer true intersections, scale with spare count.
   const shouldBombHere = canPlace && !bombAlreadyHere && scoreHere >= 0
-    && canEscapeBomb(state, player, gx, gy);
+    && canEscapeBomb(state, player, gx, gy)
+    && (spare >= 3 || intersectionHere || scoreHere >= 4);
 
-  // The AI might be standing on its own just-placed bomb
   const standingOnOwnBomb = state.bombs.some(
     b => b.gx === gx && b.gy === gy && b.ownerId === player.id
   );
   const bombKey = standingOnOwnBomb ? `${gx},${gy}` : undefined;
+  const enemyDist = nearestEnemyDist(state, player, gx, gy);
 
   // ======================================
   // Priority 1: SURVIVAL – Escape danger
@@ -502,13 +603,10 @@ export function decideAI(state: GameState, player: Player): AIAction {
   if (inDanger) {
     const escapePath = findSafePath(state, gx, gy, danger, bombKey);
     if (escapePath && escapePath.length > 0) {
-      const next = escapePath[0];
-      return { direction: getDirectionTo(gx, gy, next.gx, next.gy), placeBomb: false };
+      return { direction: getDirectionTo(gx, gy, escapePath[0].gx, escapePath[0].gy), placeBomb: false };
     }
     for (const { dir, dx, dy } of DIRS) {
-      const nx = gx + dx;
-      const ny = gy + dy;
-      if (isWalkable(state, nx, ny, bombKey)) {
+      if (isWalkable(state, gx + dx, gy + dy, bombKey)) {
         return { direction: dir, placeBomb: false };
       }
     }
@@ -516,10 +614,11 @@ export function decideAI(state: GameState, player: Player): AIAction {
   }
 
   // ======================================
-  // Priority 2: POWER-UPS – Rush to collect (avoid skulls!)
-  //   Drop bombs along the way if it won't hurt power-ups.
+  // Priority 2: POWER-UPS – Collect nearby bonuses
+  //   But only if no enemy is very close (≤5 tiles).
+  //   Drop strategic bombs at intersections en route.
   // ======================================
-  {
+  if (enemyDist > 5) {
     const goodPUs = state.powerUps.filter(p => p.type !== 'skull');
     if (goodPUs.length > 0) {
       const puPath = findPath(state, gx, gy, (px, py) => {
@@ -527,50 +626,71 @@ export function decideAI(state: GameState, player: Player): AIAction {
       }, danger, 20);
       if (puPath && puPath.length > 0) {
         const dir = getDirectionTo(gx, gy, puPath[0].gx, puPath[0].gy);
-        // Bomb along the way if it won't destroy power-ups
-        return { direction: dir, placeBomb: shouldBombHere && scoreHere > 0 };
+        // Drop bomb at true intersections on the way to power-ups
+        const dropOnWay = shouldBombHere && intersectionHere && scoreHere > 0;
+        return { direction: dir, placeBomb: dropOnWay };
       }
     }
   }
 
   // ======================================
-  // Priority 3: OFFENSE – Attack enemies
-  //   Always bomb if enemy is in range.
-  //   Always drop trail bombs while chasing.
+  // Priority 3: OFFENSE – Strategic multi-bomb trapping
+  //   3a) Enemy in direct blast range → bomb immediately
+  //   3b) Move to a tile that creates a trap (score with trap bonus)
+  //   3c) Move to an intersection near enemy and bomb to cut off routes
+  //   3d) Chase enemy aggressively, trail-bombing intersections
   // ======================================
   {
-    // 3a) Enemy in blast range right now — bomb immediately
-    if (canPlace && scoreHere >= 10 && canEscapeBomb(state, player, gx, gy)) {
+    // 3a) Direct hit opportunity
+    if (canPlace && scoreHere >= 12 && canEscapeBomb(state, player, gx, gy)) {
       return { direction: 'none', placeBomb: true };
     }
 
-    // 3b) Find a tile where we'd hit an enemy
+    // 3b) Find a nearby intersection or tile with high trap/score value
     if (canPlace) {
-      const atkPath = findPath(state, gx, gy, (px, py) => {
-        return bombScore(state, player, px, py) >= 10;
-      }, danger, 10);
-      if (atkPath && atkPath.length > 0) {
-        const dir = getDirectionTo(gx, gy, atkPath[0].gx, atkPath[0].gy);
-        // Always trail-bomb while heading to attack position
+      const trapPath = findPath(state, gx, gy, (px, py) => {
+        const s = bombScore(state, player, px, py, danger);
+        // Good offensive tile: high score, or true intersection near enemy
+        return s >= 10 || (isIntersectionTile(state, px, py) && s >= 4);
+      }, danger, 12);
+      if (trapPath && trapPath.length > 0) {
+        const dir = getDirectionTo(gx, gy, trapPath[0].gx, trapPath[0].gy);
+        // If we're AT the target, bomb. Otherwise trail-bomb intersections.
+        if (trapPath.length === 1) {
+          const tgx = trapPath[0].gx, tgy = trapPath[0].gy;
+          if (canEscapeBomb(state, player, tgx, tgy)) {
+            return { direction: dir, placeBomb: shouldBombHere };
+          }
+        }
         return { direction: dir, placeBomb: shouldBombHere };
       }
     }
 
-    // 3c) Chase nearest enemy and trail-bomb the whole way
-    const enemyDist = nearestEnemyDist(state, player, gx, gy);
+    // 3c) Chase nearest enemy — prefer moving to intersections
+    //     along the way and bombing them to create area denial.
     if (enemyDist < 999) {
+      // First try to reach an intersection near the enemy
+      const junctionPath = findPath(state, gx, gy, (px, py) => {
+        const nearEnemy = nearestEnemyDist(state, player, px, py);
+        return nearEnemy <= 3 && isIntersectionTile(state, px, py);
+      }, danger, 20);
+      if (junctionPath && junctionPath.length > 0) {
+        const dir = getDirectionTo(gx, gy, junctionPath[0].gx, junctionPath[0].gy);
+        return { direction: dir, placeBomb: shouldBombHere };
+      }
+
+      // Direct chase to enemy position
       const chasePath = findPath(state, gx, gy, (px, py) => {
         for (const other of state.players) {
           if (other.id === player.id || !other.alive) continue;
           const ogx = Math.floor(other.x / T);
           const ogy = Math.floor(other.y / T);
-          if (Math.abs(ogx - px) + Math.abs(ogy - py) <= 2) return true;
+          if (Math.abs(ogx - px) + Math.abs(ogy - py) <= 1) return true;
         }
         return false;
-      }, danger, 20);
+      }, danger, 30);
       if (chasePath && chasePath.length > 0) {
         const dir = getDirectionTo(gx, gy, chasePath[0].gx, chasePath[0].gy);
-        // Trail-bomb while chasing
         return { direction: dir, placeBomb: shouldBombHere };
       }
     }
@@ -578,34 +698,28 @@ export function decideAI(state: GameState, player: Player): AIAction {
 
   // ======================================
   // Priority 4: CLEARING – Destroy bricks
-  //   Bomb any tile next to a brick.
-  //   Trail-bomb while moving toward bricks.
+  //   Prefer tiles that hit multiple bricks AND are intersections.
   // ======================================
   {
-    const bricksHere = countBrickHits(state, gx, gy, player.flameRange, player.hasPierce);
-
-    // Standing next to bricks — bomb immediately
-    if (canPlace && bricksHere >= 1 && scoreHere >= 0 && canEscapeBomb(state, player, gx, gy)) {
+    // Bomb here if useful
+    if (canPlace && scoreHere > 0 && canEscapeBomb(state, player, gx, gy)) {
       return { direction: 'none', placeBomb: true };
     }
 
-    // Move toward bricks, trail-bomb the whole way
+    // Move toward the best brick-clearing spot (score-based)
     const brickPath = findPath(state, gx, gy, (px, py) => {
-      return countBrickHits(state, px, py, player.flameRange, player.hasPierce) >= 1
-        && bombScore(state, player, px, py) >= 0;
+      const bricks = countBrickHits(state, px, py, player.flameRange, player.hasPierce);
+      const s = bombScore(state, player, px, py, danger);
+      return bricks >= 1 && s > 0;
     }, danger, 20);
 
     if (brickPath && brickPath.length > 0) {
       if (detectLoop(mem)) {
         mem.lastPositions = [];
-        const safeDirs = DIRS.filter(d => {
-          const nx = gx + d.dx;
-          const ny = gy + d.dy;
-          return isWalkable(state, nx, ny) && !isDangerous(danger, nx, ny);
-        });
-        if (safeDirs.length > 0) {
-          const pick = safeDirs[Math.floor(Math.random() * safeDirs.length)];
-          return { direction: pick.dir, placeBomb: shouldBombHere };
+        const sd = DIRS.filter(d =>
+          isWalkable(state, gx + d.dx, gy + d.dy) && !isDangerous(danger, gx + d.dx, gy + d.dy));
+        if (sd.length > 0) {
+          return { direction: sd[Math.floor(Math.random() * sd.length)].dir, placeBomb: shouldBombHere };
         }
       }
       const dir = getDirectionTo(gx, gy, brickPath[0].gx, brickPath[0].gy);
@@ -614,9 +728,8 @@ export function decideAI(state: GameState, player: Player): AIAction {
   }
 
   // ======================================
-  // Priority 5: HUNT / WANDER
-  //   No bricks left — chase enemies or wander.
-  //   ALWAYS trail-bomb to create pressure.
+  // Priority 5: HUNT – No bricks left, chase enemies
+  //   Move toward intersections near enemies and bomb them.
   // ======================================
   {
     const huntPath = findPath(state, gx, gy, (px, py) => {
@@ -624,10 +737,10 @@ export function decideAI(state: GameState, player: Player): AIAction {
         if (other.id === player.id || !other.alive) continue;
         const ogx = Math.floor(other.x / T);
         const ogy = Math.floor(other.y / T);
-        if (Math.abs(ogx - px) + Math.abs(ogy - py) <= 3) return true;
+        if (Math.abs(ogx - px) + Math.abs(ogy - py) <= 2) return true;
       }
       return false;
-    }, danger, 25);
+    }, danger, 40);
 
     if (huntPath && huntPath.length > 0) {
       const dir = getDirectionTo(gx, gy, huntPath[0].gx, huntPath[0].gy);
@@ -635,17 +748,19 @@ export function decideAI(state: GameState, player: Player): AIAction {
     }
   }
 
-  // Last resort: wander randomly, always bombing
+  // Last resort: wander, prefer intersections, always bomb
   const safeDirs = DIRS.filter(d => {
-    const nx = gx + d.dx;
-    const ny = gy + d.dy;
+    const nx = gx + d.dx, ny = gy + d.dy;
     return isWalkable(state, nx, ny) && !isDangerous(danger, nx, ny) && !hasSkullAt(state, nx, ny);
   });
   if (safeDirs.length > 0) {
-    const currentDir = safeDirs.find(d => d.dir === player.direction);
-    const dir = (currentDir && Math.random() < 0.7)
+    // Prefer moving toward a true intersection
+    const junctionDirs = safeDirs.filter(d => isIntersectionTile(state, gx + d.dx, gy + d.dy));
+    const pool = junctionDirs.length > 0 ? junctionDirs : safeDirs;
+    const currentDir = pool.find(d => d.dir === player.direction);
+    const dir = (currentDir && Math.random() < 0.6)
       ? currentDir.dir
-      : safeDirs[Math.floor(Math.random() * safeDirs.length)].dir;
+      : pool[Math.floor(Math.random() * pool.length)].dir;
     return { direction: dir, placeBomb: shouldBombHere };
   }
 
